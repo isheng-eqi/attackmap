@@ -1,9 +1,9 @@
 ---
 name: attackmap
 description: >-
-  攻击面地图生成器。一轮扫出目标最多最广的可攻击面。
-  并行执行、广度优先、快速收敛。5 分钟出完整攻击面图谱。
-version: "2.4.0"
+  攻击面地图生成器——像智者一样层层探索，直到每一个可能的渗透点都被覆盖。
+  rule=罗盘而非牢笼：skill告诉你方向，不限制你去哪里。
+version: "3.0.0"
 dependencies: "curl, node>=16, nslookup"
 platforms: "Linux, macOS, Windows (Git Bash)"
 when_to_use: >-
@@ -11,258 +11,159 @@ when_to_use: >-
   触发词: "attackmap" "attack-map" "攻击面" "攻击面地图" "渗透测试" "pentest" "帮我扫一下"
 ---
 
-# 🗺️ AttackMap v2.4
+# 🗺️ AttackMap v3.0
 
-> **一个任务：用最少请求画出完整攻击面地图，标注最高价值入口。**
+> **第一原则：你是智者，不是工人。skill 是罗盘，不是牢笼。**
 >
-> **核心改进 (v2.4)：从"只懂 SPA/API 型网站"变成"能自动适应大学门户、政府网站、企业 CMS 等任何类型"。**
+> 每次发现一条线索（一个域名、一个 JS 文件、一个 API 响应、一段报错信息），
+> 你只有一个问题要问自己：
+>
+> **"从这里还能往哪挖？我把它挖干净了吗？"**
+>
+> 如果没挖干净——继续。如果挖干净了——看下一条线索。
+> skill 给方向，但不设上限。永远不做"任务完成"的工人。
 
 ---
 
-## 快速执行
+## 勘探心智模型
 
 ```
-Step 0: 通道探测 (2请求) — curl不通立刻切node
-Step 1: 指纹+子域名 (并行5请求)
-Step 2: CMS识别 → 立刻搜该CMS已知漏洞 (WebSearch, 不打目标)
-Step 3: 攻击面扩展 (基于CMS类型动态选择探测路径)
-Step 4: 输出地图
-```
+你拿到一条信息：
+  ├── 这条信息指向什么？（技术栈/产品/公司/人）
+  ├── 和我已知的其他信息有关系吗？（交叉验证）
+  ├── 还能从这里推导出什么？（公司其他域名、内部系统命名规则）
+  ├── 有没有"看起来不重要但可能很关键"的细节？
+  └── 我已经把这条信息的所有分支都挖透了吗？
 
-**总请求硬限制: 30。超过还没画完 → 现有结果直接输出。**
-
----
-
-## Step 0: 通道探测
-
-> v2.4 ⚡: curl 在高校/政府网站经常 TLS 握手失败。立刻切 node。
-
-```
-1. curl 正常请求。响应为空/超时/连接重置？
-   → 立刻用 node https.get 重试。
-   → node 也失败？IPv6 优先？→ curl -4 或 nslookup 查 IPv4 再试。
-
-2. 通道通了，做2个请求判断是否有 WAF：
-   - 正常请求
-   - 带 SQL 字符串的请求
-   两个都正常？→ 无 WAF。有差异？→ 记录 WAF 行为，后续慢速+XFF。
-```
-
-**通道不通知用户。自己解决。只有 node + curl -4 + HTTP 回退全失败时才告诉用户网络不通。**
-
----
-
-## Step 1: 指纹收集（并行：HTTP + DNS + crt.sh）
-
-```
-并行执行以下（不打目标的不计数）：
-  - 首页 HTML（前500行够用）
-  - 响应头
-  - DNS 全记录（A/MX/TXT/NS/SOA）
-  - crt.sh SSL 透明度 → 子域名列表
-  - 一个不存在的路径 → 看 404 格式
-```
-
-**指纹推断表（新增 CMS 识别）：**
-
-| 观察 | 推断 |
-|------|------|
-| HTML注释含 `<!--Announced by Visual SiteBuilder` | 博达网站群 |
-| HTML含 `__VIEWSTATE` | ASP.NET WebForms |
-| 响应头 `X-AspNet-Version` | ASP.NET + IIS |
-| 响应头 `X-Powered-By: PHP/7.x` | PHP |
-| `Set-Cookie: JSESSIONID` | Java (Tomcat/JBoss) |
-| `Server: nginx` + JSON 404 | Spring Boot / 前后端分离 |
-| 首页 `<title>` 含"大学/学院/政府" | 教育/政府门户 → 搜该机构公开信息 |
-| JS 文件名含 `chunk-` + hash | React/Vue SPA |
-| JS 文件名含 `jquery.min.js` 且无其他框架 | 传统多页面 |
-| 登录页 HTML 含"默认密码为"或"初始密码" | ⚡立刻记录—这是可直接利用的凭据 |
-
-**crt.sh 子域名拿到后立即批量探测（不计入30请求限额，因为是扩展资产）：**
-
-对 crt.sh 返回的每个子域名，并行 HEAD 请求（最多20个并发）。响应的计入地图，不响应的忽略。
-
----
-
-## Step 2: CMS 识别 → 即刻搜已知漏洞
-
-> v2.4 ⚡: 这是 Step 1 的自然延伸，不是独立步骤。
-
-Step 1 识别到 CMS 名称后，**不要等到 Step 3 才处理**。立刻：
-
-```
-并行 WebSearch（2-3个不同关键词）:
-  "<CMS名称> 漏洞 CVE"
-  "<CMS名称> 渗透 越权 SQL注入"
-  "<CMS名称> default password path"
-
-搜索结果直接写入地图的"风险标注"部分。
-```
-
-**如果 CMS 是商业闭源软件（如博达、东软）：**
-- 搜索时会发现历史漏洞文章（如 WooYun 存档）
-- 从漏洞文章中提取具体攻击路径（如 `/system/site/site_list.jsp`）
-- 这些路径直接作为 Step 3 的探测目标
-
----
-
-## Step 3: 攻击面扩展（CMS 类型决定探测列表）
-
-> v2.4 ⚡: 不再用一套万能字典。根据 Step 1 识别的技术栈，选择对应的探测列表。
-
-**分支 A: Spring Boot / 前后端分离**
-```
-/.git/config, /.env, /actuator/health, /actuator/env
-/swagger-ui.html, /v2/api-docs, /v3/api-docs, /doc.html
-/api, /api/user/login, /api/admin
-/robots.txt, /sitemap.xml
-```
-
-**分支 B: JSP / Java 传统应用（大学门户最常见）**
-```
-/system/                        ← 最常见的管理后台路径
-/system/index.jsp
-/system/login.jsp
-/system/user/user_list.jsp      ← 博达 CMS 特征路径
-/system/site/site_list.jsp
-/system/content/content_list.jsp
-/manager/html                   ← Tomcat 管理
-/cas/login                      ← CAS 统一认证
-/admin/, /console/
-/.svn/entries, /WEB-INF/web.xml
-```
-
-**分支 C: ASP.NET / IIS**
-```
-/Admin/, /Manage/, /umbraco/, /umbraco/login
-/WebResource.axd, /Telerik.Web.UI.WebResource.axd
-/elmah.axd, /trace.axd
-```
-
-**分支 D: PHP / CMS**
-```
-/wp-admin, /wp-json, /wp-content/debug.log
-/administrator, /user/login
-/phpinfo.php, /info.php
-```
-
-**分支 E: 通用（所有类型都测）**
-```
-/robots.txt, /sitemap.xml, /.git/config, /.env, /backup.zip
-```
-
-**每个探测路径只发 HEAD 请求（不下载 body）。最多15个路径。超过15个 → 按价值排序，低价值的跳过。**
-
----
-
-## Step 4: 端点分级
-
-对 Step 2/3 发现的可访问端点做两次请求（GET + POST 空body）：
-
-```
-返回200 + 实际内容 → 🔓 公开
-返回200 + "请登录" → 🔒 需认证  
-返回302 重定向到 CAS → 🔒 需SSO认证
-返回403 + "权限不足" → 🔐 管理员
-返回404 → 不存在
-返回401 → 🔒 需HTTP认证
+每次挖掘停止时问自己：
+  - 我是因为"skill 清单做完了"而停？❌ 不对。
+  - 我是因为"这条线索真的到尽头了"而停？✅ 对的。
 ```
 
 ---
 
-## Step 5: 输出攻击面地图
-
-用这个格式，**CMS 类型决定⭐标注内容**：
+## 勘探漏斗（方向指引，不是步骤清单）
 
 ```
-🗺️ 攻击面地图 — TARGET
-═══════════════════════
+第一层：域名 DNA 测序
+  DNS → crt.sh → 首页 → 响应头 → HTML注释 → JS文件列表
+  → 从上面任何一条线索发现: 关联域名 / CDN域名 / 公司名 / 产品名
+  → 公司名/产品名 → 搜关联域名（不只搜当前域名的 crt.sh）
+  → CDN 403 → 加 Referer 重试，不跳过
 
-🏗️ CMS/框架: [名称 + 版本]
-  前端: [SPA/传统]  |  后端: [语言/框架]  |  服务器: [nginx/apache/iis/版本]
-  WAF: [有/无 + 类型]  |  DNS: [自建/第三方]
-  ⚡开源: [仓库链接] / 商业闭源 / 定制开发
+第二层：从 JS 里挖矿
+  下载首页引用的每一个 JS → 不是随便 grep 一下就完事
+  → 提取: 所有 URL、所有路径、所有子域名、所有第三方域名
+  → 对每个 URL: 它指向什么服务？能不能访问？有没有 API？
+  → JS 太大（>100KB）→ 用 node 解析，不是 grep
+  → JS 混淆了 → 记录但不纠结，继续下一条线索
 
-🌐 子域名 (N个存活):
-  sub1.target.edu.cn    → ✅ (服务名/框架)
-  sub2.target.edu.cn    → ❌ 不可达
-  ...
+第三层：从页面内容里找线索
+  每个页面（首页/登录/注册/忘记密码/关于我们/帮助）:
+  → HTML 注释 (<!-- XXX -->) → 可能泄露 CMS/框架/内部信息
+  → meta 标签 → 关键词/描述/作者
+  → 表单字段名 → 参数名
+  → "默认密码" / "初始密码" / "忘记密码" → 凭据策略
+  → 第三方 SDK（百度统计/神策/友盟）→ 可能泄露额外域名
 
-📡 发现端点:
-  ⭐ = 最高价值入口
+第四层：子域名字典不能只靠 crt.sh
+  crt.sh 给的 ≠ 全部子域名
+  → 基于公司名/业务线推测: gateway/log/monitor/bi/report/ops/adminer
+  → 基于常见内部服务: jenkins/gitlab/grafana/kibana/elk/nacos
+  → 基于业务: partner/agent/open/developer/merchant
+  → 每个新发现的子域名 → 它的 JS/HTML 里可能引用更多子域名
 
-  🔓 公开:
-    ⭐ /system/  ← 管理后台 (CMS=博达)
-    ⭐ /cas/login ← CAS统一认证 (产品=东软tpass)
-    ...
+第五层：跨公司关联
+  如果首页/footer/招聘页面提到关联公司/集团:
+  → 搜这家公司所有域名 → 递归挖掘
+  → 关联公司的 crt.sh → 可能和当前域名共用基础设施
+  → 从当前网站 JS 中提取的其他域名 → 关联
 
-  🔒 需认证: ...
+第六层：每个 API 响应都是一条线索
+  {"code":1,"msg":"projectId 不能为空"} → 参数名泄露
+  "Shuidi Gateway..." → 产品名确认
+  CORS: * → 可以跨域调用
+  404 格式 → 框架指纹
+  任何错误消息 → 信息泄露
 
-🗂️ 敏感路径: ...
-
-🔑 认证机制:
-  [用户名/密码方式]
-  [加密算法 + 密钥是否公开]  ← 新增，POETIZE和tyut都有这问题
-  [Token/Cookie/Session机制]
-  ⚡ [默认密码策略] ← 如果登录页 HTML 直接写了规则
-
-⚠️ 按攻击价值排序:
-  ⭐#1: [认证入口] → [具体的攻击方式，不是泛泛的"认证绕过"]
-  ⭐#2: [CMS漏洞] → [引用搜索结果中的具体CVE/路径]
-  ⭐#3: [加密缺陷] → [密钥硬编码/弱算法/默认密码]
-  #4: ...
+第七层：CMS/框架识别 → 搜已知漏洞（最后一层，因为信息够了）
+  不是泛泛搜 "<CMS> 漏洞"
+  → 搜: "<CMS> <具体版本号> CVE"
+  → 搜: "<CMS> 未授权访问"
+  → 搜: "<CMS> 默认密码"
+  → 搜: "<CMS> 渗透 实战"
 ```
 
 ---
 
-## 📊 第二轮深度攻击的信号排序
+## 输出物：攻击面地图
 
-| 优先级 | 打什么 | 为什么 |
-|--------|--------|--------|
-| ⭐1 | CMS 已知漏洞 | 有 CVE/公开分析文章，直接验证 |
-| ⭐2 | 认证绕过/默认密码 | 高校/政府系统默认密码很常见 |
-| ⭐3 | 加密缺陷利用 | 密钥在 JS 里 → 可伪造签名 |
-| ⭐4 | 反序列化/SSTI | 框架决定（Spring/Fastjson/Jinja2） |
-| ⭐5 | 敏感路径直接访问 | .jsp/.aspx 直接访问 |
-| 6 | 未授权 API | 公开端点 |
-| 7 | CSRF/IDOR | 有 token 后低成本 |
-| 8 | 爆破/枚举 | ⚠️ 放最后 |
+地图不是任务清单的完成标记——它是**当前已知所有线索的汇总**。
 
-**区别**: 这个表跟 v2.3 不同——v2.3 把"反序列化 RCE"排第一，但那是对 SPA/API 型网站。对大学门户，"CMS 已知漏洞"排第一。
+```
+🗺️ sdbao.com 攻击面地图
+═══════════════════════════════
+
+🏗️ 技术栈
+  前端: Nuxt.js SSR + Element UI
+  API网关: APISIX (Shuidi Gateway)
+  云平台: 腾讯云 (北京, 8节点CLB)
+  关联公司: shuidihuzhu.com, shuidi-inc.com, shuidi.cn
+
+🌐 子域名 (当前已发现11个)
+  www.sdbao.com          ✅ Nuxt SSR 主站
+  api.sdbao.com          ✅ APISIX网关
+  gateway.sdbao.com      ✅ APISIX网关
+  log.sdbao.com          ✅ 日志网关
+  static1.sdbao.com      🔒 CDN (Referer可绕过)
+  store.sdbao.com        🔒 CDN
+  ds.shuidihuzhu.com     🔓 内部实验API (CORS:*)
+  api.shuidihuzhu.com    ✅ 互助API网关
+  www.shuidi-inc.com     ✅ 母公司官网
+  ... (继续枚举中)
+
+📡 API 端点
+  ⭐ ds.shuidihuzhu.com/api/hawkeye/experiment/query
+    → CORS:* → 可跨域调用
+    → 参数: projectId (必需)
+    → 产品: Hawkeye (A/B实验平台)
+  
+  ⭐ api.sdbao.com/api/health → "OK"
+
+🔑 认证: 未知 (登录页存在但无法提取加密逻辑)
+
+⚠️ 攻击入口 (按价值):
+  ⭐#1: APISIX CVE-2020-13945 默认token
+  ⭐#2: ds.shuidihuzhu.com CORS:* + 参数注入
+  ⭐#3: APISIX CVE-2025-46647 OIDC绕过
+  #4: log/gateway 网关未授权
+  #5: 供应链: npm恶意包 sdbao-content-*
+```
 
 ---
 
-## ⛔ 地图阶段绝对不做的
+## 停止条件
 
-| 不做的事 | 原因 |
-|----------|------|
-| curl 失败后反复用同方式重试 | 切 node / curl -4 / HTTP回退 |
-| 同一 payload 在不同端点重复测 | 第一个点被防了后面也不会通 |
-| 等待 WAF 冷却 | 切通道——XFF轮换、慢速 |
-| 对着确认安全的框架做注入 | JSP 多页面 ≠ 有 SQL 注入；先搜 CMS 漏洞再打 |
+以下情况才算一条线索"挖完了"：
+- 已经尝试了所有合理的方向，全部回"不存在"或"无响应"
+- 需要用户提供凭据/账号才能继续
 
----
-
-## 🤝 什么时候请求用户
-
-| 时机 | 请求 |
-|------|------|
-| 通道全失败（curl + node + HTTP 都不通） | "你的网络环境访问这个目标有问题，你能用浏览器打开吗？" |
-| 发现登录页有验证码且没有已知绕过 | "登录页有验证码。你有测试账号吗？能帮我 F12 抓一个登录请求吗？" |
-| 地图输出后 | "这是攻击面地图。⭐标注的是最高价值入口，从哪个开始？" |
-| 需要写操作验证 | "这一步会修改数据，我操作后会还原。是否继续？" |
+以下情况不算"挖完了"：
+- "skill 的探测清单做完了" ❌
+- "试了 5 种组合都返回 404" — 可能路径不在顶级域名 ❌
+- "JS 太大了 grep 搜不到" — 用 node 解析 ❌
+- "CDN 返回 403" — 加 Referer 重试 ❌
 
 ---
 
-## 💀 实战踩坑（POETIZE + tyut 两次教训）
+## 💀 三次实战的教训
 
-| 实际做的 | 应该做的 | 浪费了什么 |
-|----------|---------|-----------|
-| curl HTTPS 对 tyut 失败→没切 node | 一次失败立刻切 node https.get | 卡了半分钟排查 |
-| 识别到"Visual SiteBuilder 9"后继续扫路径 | **立刻 WebSearch 搜该 CMS 已知漏洞** | CMS 漏洞信息拿晚了 |
-| crt.sh 子域名逐个 curl | 批量并行 HEAD 请求 | 多花了 2 分钟 |
-| 风险排序用"反序列化 #1"模板 | **看 CMS 类型决定排序**——大学门户先打 CMS 漏洞和默认密码 | 排序偏差 |
-| 登录页 HTML 里写了"tyut+身份证后6位" | 立刻作为高价值信息输出到地图 | 如果没仔细看 HTML 就漏了 |
-| 对博达后台用 SPA 型字典 (/api,/actuator) | 用 JSP/CMS 专用字典 (/system/*.jsp) | 10+ 个 404 |
-| 先 curl 首页、下载 JS、逆向（POETIZE） | 第一步搜 GitHub → 5 秒找到源码 | 1小时 + 20+ 无效请求 |
-| SVG 验证码搞 OCR（POETIZE） | 直接跳过 | 30+ 分钟 |
+| 教训 | 表现 | 正确做法 |
+|------|------|---------|
+| 不能因为 CDN 403 就跳过 JS 分析 | sdbao: 403 → 没下载 JS → 漏了 ds.shuidihuzhu.com | **CDN 403 ≠ 文件不可读，加 Referer** |
+| 不能只靠 crt.sh 做子域名发现 | sdbao: crt.sh 只有 4 个域名 → 实际 11 个 | **业务推测 + 字典 + 关联公司枚举** |
+| 不能只搜当前域名的 crt.sh | sdbao: 没搜 shuidihuzhu.com → 漏了整个互助域 | **公司名 → 搜所有关联域名** |
+| 不能用 grep 处理 556KB 的 JS | sdbao: grep 从 556KB 里只搜出 1 个 URL | **大 JS 用 node 逐模式解析** |
+| 识别到 CMS 后不能只搜中文关键词 | sdbao: "水滴保 渗透" → 无结果 | **产品名 + 英文 CVE 搜索** |
+| 不能把 skill 当检查清单 | POETIZE: 在 login 参数上爆了 20 次 | **15 次无结果 → 不是参数名错了，是编码/传输方式错了** |
+| 发现了一个公司名不能停 | sdbao: 看到"水滴"但没继续搜关联公司 | **公司名 = 整个集团的所有域名都是攻击面** |
