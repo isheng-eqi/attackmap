@@ -3,7 +3,7 @@ name: attackmap
 description: >-
   攻击面地图生成器。一轮扫出目标最多最广的可攻击面。
   并行执行、广度优先、快速收敛。5 分钟出完整攻击面图谱。
-version: "2.3.0"
+version: "2.4.0"
 dependencies: "curl, node>=16, nslookup"
 platforms: "Linux, macOS, Windows (Git Bash)"
 when_to_use: >-
@@ -11,227 +11,224 @@ when_to_use: >-
   触发词: "attackmap" "attack-map" "攻击面" "攻击面地图" "渗透测试" "pentest" "帮我扫一下"
 ---
 
-# 🗺️ AttackMap v2.3
+# 🗺️ AttackMap v2.4
 
-> **你只有一个任务：用最少的请求画出最完整的攻击面地图，然后告诉用户"从哪开始打"。**
-
----
-
-## 执行决策树（按这个顺序，不是按脚本）
-
-```
-Step 0: WAF 测绘 (3个请求)
-  └─ 用 WAF 结果决定后续所有请求的节奏
-
-Step 1: 指纹收集 (并行, 5个请求)
-  └─ 响应头 + 首页HTML + DNS + 首页JS文件列表
-
-Step 2: 源码搜索 (0-1个请求)
-  └─ 在线搜索，不是本地 grep
-
-Step 3: 攻击面扩展 (基于 Step 1/2 结果动态决定)
-  ├─ 有源码 → 直接读 Controller (0请求)
-  ├─ 无源码但前端 JS 可读 → 从 JS 提取路由 (1-2个请求)
-  ├─ 有无认证入口 → 拿 token 测权限 (等用户配合)
-  └─ 以上都没用 → 轻量字典探测 (最多15个路径)
-
-Step 4: 端点分级 (请求已有端点, 不枚举新路径)
-  └─ 区分 "公开/需认证/管理员" 三类
-
-Step 5: 输出地图 + 标注最高价值入口
-```
-
-**核心约束**：整个流程总请求数控制在 30 以内。超过 30 还没画完 → 说明目标攻击面确实很小 → 直接输出现有结果。
+> **一个任务：用最少请求画出完整攻击面地图，标注最高价值入口。**
+>
+> **核心改进 (v2.4)：从"只懂 SPA/API 型网站"变成"能自动适应大学门户、政府网站、企业 CMS 等任何类型"。**
 
 ---
 
-## Step 0: WAF 测绘（必须先做）
+## 快速执行
 
-> 不用前面的 bash 端口扫描。用最少的请求判断是否存在 WAF 以及它的行为。
-
-```bash
-# 测试1: 正常请求 → 获取基准
-curl -sI "https://TARGET/" --max-time 5
-
-# 测试2: 带明显的SQL注入字符串
-curl -sI "https://TARGET/?test=1' OR '1'='1" --max-time 5
-
-# 测试3: 快速连发5个请求看是否触发限频
-for i in 1 2 3 4 5; do
-  curl -sI -o /dev/null -w "%{http_code} " "https://TARGET/" --max-time 3
-done
+```
+Step 0: 通道探测 (2请求) — curl不通立刻切node
+Step 1: 指纹+子域名 (并行5请求)
+Step 2: CMS识别 → 立刻搜该CMS已知漏洞 (WebSearch, 不打目标)
+Step 3: 攻击面扩展 (基于CMS类型动态选择探测路径)
+Step 4: 输出地图
 ```
 
-**判断逻辑：**
+**总请求硬限制: 30。超过还没画完 → 现有结果直接输出。**
+
+---
+
+## Step 0: 通道探测
+
+> v2.4 ⚡: curl 在高校/政府网站经常 TLS 握手失败。立刻切 node。
+
 ```
-测试2返回403且有WAF品牌页面 → 内容型WAF
-测试3出现429/503/连接重置 → 频率型WAF
-测试3最后一个请求非200 → 频率型WAF, 阈值≤5
-都没有异常 → 无WAF或阈值很高
-```
+1. curl 正常请求。响应为空/超时/连接重置？
+   → 立刻用 node https.get 重试。
+   → node 也失败？IPv6 优先？→ curl -4 或 nslookup 查 IPv4 再试。
 
-**如果有 WAF → 立即调整节奏：**
-- 后续所有请求加 X-Forwarded-For 头轮换
-- 后续每个请求间隔至少 2 秒
-- 不要并行发批量请求
-
-## Step 1: 指纹收集（并行5个请求）
-
-> 这5个请求不触发 WAF（间隔足够大）
-
-```bash
-# 并行，每个间隔2s
-# 1. 响应头
-curl -sI "https://TARGET/" -H "X-Forwarded-For: 10.1.1.1"
-
-# 2. 首页 HTML  
-curl -s "https://TARGET/" -H "X-Forwarded-For: 10.1.1.2" | head -200
-
-# 3. DNS 全记录 (本地, 不打目标)
-nslookup TARGET && nslookup -type=MX TARGET && nslookup -type=TXT TARGET
-
-# 4. 首页 JS 文件清单
-# 从 HTML 提取 → grep for src="*.js"
-
-# 5. 随便一个不存在路径 → 看404格式
-curl -sI "https://TARGET/nonexistent999" -H "X-Forwarded-For: 10.1.1.3"
+2. 通道通了，做2个请求判断是否有 WAF：
+   - 正常请求
+   - 带 SQL 字符串的请求
+   两个都正常？→ 无 WAF。有差异？→ 记录 WAF 行为，后续慢速+XFF。
 ```
 
-**从这5个请求推断：**
+**通道不通知用户。自己解决。只有 node + curl -4 + HTTP 回退全失败时才告诉用户网络不通。**
+
+---
+
+## Step 1: 指纹收集（并行：HTTP + DNS + crt.sh）
+
+```
+并行执行以下（不打目标的不计数）：
+  - 首页 HTML（前500行够用）
+  - 响应头
+  - DNS 全记录（A/MX/TXT/NS/SOA）
+  - crt.sh SSL 透明度 → 子域名列表
+  - 一个不存在的路径 → 看 404 格式
+```
+
+**指纹推断表（新增 CMS 识别）：**
 
 | 观察 | 推断 |
 |------|------|
-| `Server: nginx` + JSON错误格式 | Spring Boot / Express 后端 |
-| JS文件名含 `vendor.element-ui` | Vue.js + Element UI |
-| JS文件名含 `chunk-` + hash | React / Vue 打包 |
-| 404返回HTML | SPA |
-| 404返回 `{"error":"Not Found"}` | API 服务器 |
-| `Set-Cookie: Authorization=` | Token 认证 |
-| 首页 `<title>` 含品牌名 | 去 GitHub 搜这个 |
+| HTML注释含 `<!--Announced by Visual SiteBuilder` | 博达网站群 |
+| HTML含 `__VIEWSTATE` | ASP.NET WebForms |
+| 响应头 `X-AspNet-Version` | ASP.NET + IIS |
+| 响应头 `X-Powered-By: PHP/7.x` | PHP |
+| `Set-Cookie: JSESSIONID` | Java (Tomcat/JBoss) |
+| `Server: nginx` + JSON 404 | Spring Boot / 前后端分离 |
+| 首页 `<title>` 含"大学/学院/政府" | 教育/政府门户 → 搜该机构公开信息 |
+| JS 文件名含 `chunk-` + hash | React/Vue SPA |
+| JS 文件名含 `jquery.min.js` 且无其他框架 | 传统多页面 |
+| 登录页 HTML 含"默认密码为"或"初始密码" | ⚡立刻记录—这是可直接利用的凭据 |
 
-## Step 2: 源码搜索
+**crt.sh 子域名拿到后立即批量探测（不计入30请求限额，因为是扩展资产）：**
 
-基于首页 `<title>` 或 `<meta>` 中提取的网站名称：
+对 crt.sh 返回的每个子域名，并行 HEAD 请求（最多20个并发）。响应的计入地图，不响应的忽略。
+
+---
+
+## Step 2: CMS 识别 → 即刻搜已知漏洞
+
+> v2.4 ⚡: 这是 Step 1 的自然延伸，不是独立步骤。
+
+Step 1 识别到 CMS 名称后，**不要等到 Step 3 才处理**。立刻：
 
 ```
-在线搜索: "<网站名> github" 或 "<网站名> 源码 gitee"
-搜索结果指向开源仓库 → 直接从 GitHub 读 Controller
-没有结果 → 跳过, 不纠结
+并行 WebSearch（2-3个不同关键词）:
+  "<CMS名称> 漏洞 CVE"
+  "<CMS名称> 渗透 越权 SQL注入"
+  "<CMS名称> default password path"
+
+搜索结果直接写入地图的"风险标注"部分。
 ```
 
-**找到源码后的动作（最节省请求的方式）：**
-```bash
-# 直接用 GitHub API 遍历包结构, 不是下载文件
-curl -s "https://api.github.com/repos/USER/REPO/contents/src/.../controller"
-# 然后逐文件读取 @RequestMapping 注解
+**如果 CMS 是商业闭源软件（如博达、东软）：**
+- 搜索时会发现历史漏洞文章（如 WooYun 存档）
+- 从漏洞文章中提取具体攻击路径（如 `/system/site/site_list.jsp`）
+- 这些路径直接作为 Step 3 的探测目标
+
+---
+
+## Step 3: 攻击面扩展（CMS 类型决定探测列表）
+
+> v2.4 ⚡: 不再用一套万能字典。根据 Step 1 识别的技术栈，选择对应的探测列表。
+
+**分支 A: Spring Boot / 前后端分离**
+```
+/.git/config, /.env, /actuator/health, /actuator/env
+/swagger-ui.html, /v2/api-docs, /v3/api-docs, /doc.html
+/api, /api/user/login, /api/admin
+/robots.txt, /sitemap.xml
 ```
 
-## Step 3: 攻击面扩展（动态决定，不是固定列表）
-
-**分支 A：有源码 → 直接白盒**
-- 读出所有 Controller → 完整的端点清单
-- 同时读 VO/DTO → 参数名一览
-- 读 Config → 拦截器/过滤器/cors/加密配置
-- **0 个额外请求到目标**
-
-**分支 B：无源码但前端可读 → 从 JS 提取**
-- 下载 `app.js` 和 `chunk-vendors.js`
-- 提取路由字符串：`grep -oE "'/[a-zA-Z0-9_/-]{3,60}'"`
-- JS 混淆不可读 → 跳到分支 C
-
-**分支 C：黑盒 → 轻量字典**
-- 只测这 15 个路径（不是 30+ 个）：
+**分支 B: JSP / Java 传统应用（大学门户最常见）**
 ```
-/.git/config, /.env, /robots.txt, /sitemap.xml
-/actuator/health, /swagger-ui.html, /api, /api/v1
-/admin, /login, /console, /druid/index.html
-/wp-admin, /wp-json, /administrator
+/system/                        ← 最常见的管理后台路径
+/system/index.jsp
+/system/login.jsp
+/system/user/user_list.jsp      ← 博达 CMS 特征路径
+/system/site/site_list.jsp
+/system/content/content_list.jsp
+/manager/html                   ← Tomcat 管理
+/cas/login                      ← CAS 统一认证
+/admin/, /console/
+/.svn/entries, /WEB-INF/web.xml
 ```
-- 任何一个返回非200/非SPA → 记录并继续
+
+**分支 C: ASP.NET / IIS**
+```
+/Admin/, /Manage/, /umbraco/, /umbraco/login
+/WebResource.axd, /Telerik.Web.UI.WebResource.axd
+/elmah.axd, /trace.axd
+```
+
+**分支 D: PHP / CMS**
+```
+/wp-admin, /wp-json, /wp-content/debug.log
+/administrator, /user/login
+/phpinfo.php, /info.php
+```
+
+**分支 E: 通用（所有类型都测）**
+```
+/robots.txt, /sitemap.xml, /.git/config, /.env, /backup.zip
+```
+
+**每个探测路径只发 HEAD 请求（不下载 body）。最多15个路径。超过15个 → 按价值排序，低价值的跳过。**
+
+---
 
 ## Step 4: 端点分级
 
-> 不是枚举新端点——而是**对已知端点做快速分级**。
-
-对 Step 2/3 发现的每个端点做两次请求（GET + POST 空body）:
+对 Step 2/3 发现的可访问端点做两次请求（GET + POST 空body）：
 
 ```
-返回200 + data → 🔓 公开
-返回300/303 + "请登录" → 🔒 需认证  
-返回303/403 + "权限不足" → 🔐 管理员
+返回200 + 实际内容 → 🔓 公开
+返回200 + "请登录" → 🔒 需认证  
+返回302 重定向到 CAS → 🔒 需SSO认证
+返回403 + "权限不足" → 🔐 管理员
 返回404 → 不存在
-返回500 → ❓ 格式不对，记录
+返回401 → 🔒 需HTTP认证
 ```
+
+---
 
 ## Step 5: 输出攻击面地图
 
-用这个格式。星号标注的是**最高价值入口——从这里开始打**。
+用这个格式，**CMS 类型决定⭐标注内容**：
 
 ```
 🗺️ 攻击面地图 — TARGET
 ═══════════════════════
 
-🏗️ 技术栈
-  前端: [框架]  |  后端: [语言/框架]  |  服务器: [nginx/apache/iis]
-  WAF: [产品名/无]  |  CDN: [有/无]  |  DNS: [注册商]
-  开源代码: ✅ [仓库链接] / ❌ 未找到
+🏗️ CMS/框架: [名称 + 版本]
+  前端: [SPA/传统]  |  后端: [语言/框架]  |  服务器: [nginx/apache/iis/版本]
+  WAF: [有/无 + 类型]  |  DNS: [自建/第三方]
+  ⚡开源: [仓库链接] / 商业闭源 / 定制开发
 
-🔌 入口
-  开放端口: [列表]
-  子域名: [证书透明度结果]
+🌐 子域名 (N个存活):
+  sub1.target.edu.cn    → ✅ (服务名/框架)
+  sub2.target.edu.cn    → ❌ 不可达
+  ...
 
-📡 API端点在 或 🗂️ 敏感路径
-  ⭐ = 建议优先攻击
+📡 发现端点:
+  ⭐ = 最高价值入口
 
-  🔓 无需认证:
-    ⭐ POST /api/xxx/login      ← 认证入口，格式=form/json, 加密=AES/无
-    ⭐ POST /api/xxx/any         ← 接受JSON的入口，测试反序列化
-    GET  /api/xxx/public         ← 公开数据API
+  🔓 公开:
+    ⭐ /system/  ← 管理后台 (CMS=博达)
+    ⭐ /cas/login ← CAS统一认证 (产品=东软tpass)
     ...
 
-  🔒 需认证:
-    POST /api/xxx/updateInfo     ← IDOR测试点
-    GET  /api/xxx/logout         ← CSRF测试点
-    ...
+  🔒 需认证: ...
 
-  🔐 管理员:
-    POST /api/admin/xxx          ← 提权目标
-    ...
+🗂️ 敏感路径: ...
 
-🗂️ 敏感路径
-  ✅ /sitemap.xml      → [N]条记录
-  ✅ /actuator/health  → 真实内容 / SPA fallback
-  ❌ /.git/            → [403/200/不存在]
+🔑 认证机制:
+  [用户名/密码方式]
+  [加密算法 + 密钥是否公开]  ← 新增，POETIZE和tyut都有这问题
+  [Token/Cookie/Session机制]
+  ⚡ [默认密码策略] ← 如果登录页 HTML 直接写了规则
 
-🔑 认证机制
-  方式: [用户名/邮箱/手机] + 密码 + [加密方式]
-  Token: [JWT/UUID/自定义], 存于 [Header名/Header格式/Cookie名]
-  Session: [有/无]
-
-⚠️ 风险标注（按攻击价值排序）
-  ⭐#1: [login接口] → 认证绕过/弱密码/SQL注入可能性
-  ⭐#2: [JSON入口] → Fastjson/Jackson反序列化测试
-  ⭐#3: [管理端点] → 提权/越权目标
-  #4: [公开API] → 数据泄露风险
-  #5: [其他] → ...
+⚠️ 按攻击价值排序:
+  ⭐#1: [认证入口] → [具体的攻击方式，不是泛泛的"认证绕过"]
+  ⭐#2: [CMS漏洞] → [引用搜索结果中的具体CVE/路径]
+  ⭐#3: [加密缺陷] → [密钥硬编码/弱算法/默认密码]
+  #4: ...
 ```
 
 ---
 
-## 📊 从地图到深层攻击的信号排序
+## 📊 第二轮深度攻击的信号排序
 
-地图画完之后，按顺序打：
+| 优先级 | 打什么 | 为什么 |
+|--------|--------|--------|
+| ⭐1 | CMS 已知漏洞 | 有 CVE/公开分析文章，直接验证 |
+| ⭐2 | 认证绕过/默认密码 | 高校/政府系统默认密码很常见 |
+| ⭐3 | 加密缺陷利用 | 密钥在 JS 里 → 可伪造签名 |
+| ⭐4 | 反序列化/SSTI | 框架决定（Spring/Fastjson/Jinja2） |
+| ⭐5 | 敏感路径直接访问 | .jsp/.aspx 直接访问 |
+| 6 | 未授权 API | 公开端点 |
+| 7 | CSRF/IDOR | 有 token 后低成本 |
+| 8 | 爆破/枚举 | ⚠️ 放最后 |
 
-| 优先级 | 打什么 | 为什么 | 需要什么 |
-|--------|--------|--------|---------|
-| ⭐1 | 反序列化 RCE | 一次成功=直接拿shell | JSON入口 + 确认解析器 |
-| ⭐2 | SSTI | 框架决定 | Thymeleaf/Freemarker/Jinja2 |
-| ⭐3 | 未授权API数据获取 | 零成本高收益 | 地图中标记的公开端点 |
-| ⭐4 | 认证绕过/弱凭据 | 有默认密码线索 | 源码/文档中的初始账号 |
-| 5 | IDOR | 低成本 | 用户token |
-| 6 | CSRF | 顺手 | 写操作端点 |
-| 7 | 用户枚举 | 低信号 | 忘记密码/注册接口 |
-| 8 | 爆破 | ⚠️ 放最后 | 不确定时不做 |
+**区别**: 这个表跟 v2.3 不同——v2.3 把"反序列化 RCE"排第一，但那是对 SPA/API 型网站。对大学门户，"CMS 已知漏洞"排第一。
 
 ---
 
@@ -239,33 +236,33 @@ curl -s "https://api.github.com/repos/USER/REPO/contents/src/.../controller"
 
 | 不做的事 | 原因 |
 |----------|------|
-| 用 `/logout` 验 token | 消耗 token。用只读端点验 |
-| 参数名爆破 > 5 次 | 大概率猜不出来。找用户要 F12 |
-| 同 payload 重复测不同端点 | 第一个端点被防了后面也一样 |
-| 对图形验证码做 OCR | 成功概率低，绕不过校验逻辑 |
-| 等 WAF 冷却后重新打 | 换通道——XFF轮换、慢速、80端口 |
+| curl 失败后反复用同方式重试 | 切 node / curl -4 / HTTP回退 |
+| 同一 payload 在不同端点重复测 | 第一个点被防了后面也不会通 |
+| 等待 WAF 冷却 | 切通道——XFF轮换、慢速 |
+| 对着确认安全的框架做注入 | JSP 多页面 ≠ 有 SQL 注入；先搜 CMS 漏洞再打 |
 
 ---
 
-## 🤝 何时请求用户
+## 🤝 什么时候请求用户
 
 | 时机 | 请求 |
 |------|------|
-| Step 0 WAF 确认后 | "你的站有 WAF，我会用慢速+XFF轮换扫，可能有点慢" |
-| Step 1 JS 全是混淆的 | "JS 混淆了，无法提取路由。你有这个站用什么框架开发的线索吗？" |
-| Step 3 发现登录入口 | "能注册一个测试账号吗？登录后 F12 → Network → 把 login 请求的 Payload 给我" |
-| Step 4 发现管理员端点 | "我看到有管理端点。你有管理员账号吗？"（不强制） |
-| 地图输出后 | "这是攻击面地图。⭐标注的是最高价值入口，你想从哪个开始？" |
+| 通道全失败（curl + node + HTTP 都不通） | "你的网络环境访问这个目标有问题，你能用浏览器打开吗？" |
+| 发现登录页有验证码且没有已知绕过 | "登录页有验证码。你有测试账号吗？能帮我 F12 抓一个登录请求吗？" |
+| 地图输出后 | "这是攻击面地图。⭐标注的是最高价值入口，从哪个开始？" |
+| 需要写操作验证 | "这一步会修改数据，我操作后会还原。是否继续？" |
 
 ---
 
-## 💀 POETIZE 实战复盘（教训就在反面）
+## 💀 实战踩坑（POETIZE + tyut 两次教训）
 
 | 实际做的 | 应该做的 | 浪费了什么 |
 |----------|---------|-----------|
-| 先 curl 首页、下载 JS、逆向 | 第一步搜 GitHub → 5 秒找到源码 | 1小时 + 20+ 无效请求 |
-| 拿到 token 后用 `/logout` 验证 | 用 `getUserByUsername` 等只读端点验 | 3 次重新登录 |
-| SVG 验证码搞 OCR | 直接跳过，这成功概率极低 | 30+ 分钟 |
-| login 参数名爆了 20+ 种 | 5 次没找到就找用户要 F12 | WAF 额度 + 等待 |
-| WAF 封了干等 60s-120s | 立马切 XFF 轮换 / 慢速 | 数次 60s+ 等待 |
-| 对着确认没 SQL 注入的端点继续测 | 确认 MyBatis-Plus 参数化后跳过 | 15+ 请求 |
+| curl HTTPS 对 tyut 失败→没切 node | 一次失败立刻切 node https.get | 卡了半分钟排查 |
+| 识别到"Visual SiteBuilder 9"后继续扫路径 | **立刻 WebSearch 搜该 CMS 已知漏洞** | CMS 漏洞信息拿晚了 |
+| crt.sh 子域名逐个 curl | 批量并行 HEAD 请求 | 多花了 2 分钟 |
+| 风险排序用"反序列化 #1"模板 | **看 CMS 类型决定排序**——大学门户先打 CMS 漏洞和默认密码 | 排序偏差 |
+| 登录页 HTML 里写了"tyut+身份证后6位" | 立刻作为高价值信息输出到地图 | 如果没仔细看 HTML 就漏了 |
+| 对博达后台用 SPA 型字典 (/api,/actuator) | 用 JSP/CMS 专用字典 (/system/*.jsp) | 10+ 个 404 |
+| 先 curl 首页、下载 JS、逆向（POETIZE） | 第一步搜 GitHub → 5 秒找到源码 | 1小时 + 20+ 无效请求 |
+| SVG 验证码搞 OCR（POETIZE） | 直接跳过 | 30+ 分钟 |
